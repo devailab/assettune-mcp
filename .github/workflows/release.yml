@@ -1,0 +1,199 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v1.2.3). Leave empty to use the latest pushed tag.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: '1.26.4'
+  BINARY_NAME: assettune-mcp
+  IMAGE_CLI: cmd/image/main.go
+  VIDEO_CLI: cmd/video/main.go
+  PKG_PATH: github.com/devailab/assettune-mcp/internal/server
+
+jobs:
+  resolve-version:
+    name: Resolve release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      is_prerelease: ${{ steps.v.outputs.is_prerelease }}
+    steps:
+      - name: Determine version
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          elif [ -n "${{ github.ref_name }}" ] && [[ "${{ github.ref_name }}" == v* ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            echo "No tag found in event context." >&2
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          IS_PRERELEASE="false"
+          if [[ "$VERSION" == *-* ]]; then
+            IS_PRERELEASE="true"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "Releasing tag=$TAG version=$VERSION prerelease=$IS_PRERELEASE"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: resolve-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            goos: linux
+            goarch: amd64
+            runner: ubuntu-latest
+            archive: tar.gz
+            cross_cc: ''
+          - target: linux-arm64
+            goos: linux
+            goarch: arm64
+            runner: ubuntu-latest
+            archive: tar.gz
+            cross_cc: aarch64-linux-gnu-gcc
+          - target: darwin-amd64
+            goos: darwin
+            goarch: amd64
+            runner: macos-13
+            archive: tar.gz
+            cross_cc: ''
+          - target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            runner: macos-latest
+            archive: tar.gz
+            cross_cc: ''
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install libvips (Linux)
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvips-dev
+          if [ -n "${{ matrix.cross_cc }}" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          fi
+
+      - name: Install libvips (macOS)
+        if: matrix.goos == 'darwin'
+        run: brew install vips
+
+      - name: Build binaries
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '1'
+          CC: ${{ matrix.cross_cc }}
+          CXX: ${{ matrix.cross_cc }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ldflags="-s -w -X '${{ env.PKG_PATH }}.Version=${{ needs.resolve-version.outputs.tag }}'"
+          go build -trimpath -ldflags "$ldflags" -o dist/${{ env.BINARY_NAME }} .
+          go build -trimpath -ldflags "$ldflags" -o dist/assettune-image ./cmd/image
+          go build -trimpath -ldflags "$ldflags" -o dist/assettune-video ./cmd/video
+          chmod +x dist/*
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        working-directory: dist
+        run: |
+          ARCHIVE_NAME="${{ env.BINARY_NAME }}_${{ needs.resolve-version.outputs.tag }}_${{ matrix.target }}.tar.gz"
+          tar -czf "../$ARCHIVE_NAME" .
+
+      - name: Generate checksums
+        working-directory: ${{ github.workspace }}
+        run: |
+          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
+            sha256sum "${{ env.BINARY_NAME }}_${{ needs.resolve-version.outputs.tag }}_${{ matrix.target }}.tar.gz" >> checksums.txt
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            ${{ env.BINARY_NAME }}_${{ needs.resolve-version.outputs.tag }}_${{ matrix.target }}.tar.gz
+            checksums.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    needs: [resolve-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Flatten artifact directories
+        run: |
+          mkdir -p release-assets
+          for archive in artifacts/*/; do
+            for f in "$archive"*; do
+              [ -f "$f" ] || continue
+              if [ "$(basename "$f")" = "checksums.txt" ]; then
+                cat "$f" >> release-assets/checksums.txt
+              else
+                cp "$f" release-assets/
+              fi
+            done
+          done
+          ls -la release-assets
+
+      - name: Show checksums
+        working-directory: release-assets
+        run: cat checksums.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.resolve-version.outputs.tag }}
+          name: ${{ needs.resolve-version.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ needs.resolve-version.outputs.is_prerelease == 'true' }}
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/assettune-mcp_${{ needs.resolve-version.outputs.tag }}_linux-amd64.tar.gz
+            release-assets/assettune-mcp_${{ needs.resolve-version.outputs.tag }}_linux-arm64.tar.gz
+            release-assets/assettune-mcp_${{ needs.resolve-version.outputs.tag }}_darwin-amd64.tar.gz
+            release-assets/assettune-mcp_${{ needs.resolve-version.outputs.tag }}_darwin-arm64.tar.gz
+            release-assets/checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

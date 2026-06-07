@@ -1,0 +1,29 @@
+# Build artifacts
+bin/
+assettune-mcp
+assettune-mcp.exe
+*.exe
+
+# Optimized media outputs
+*_optimized.mp4
+*_optimized.webp
+
+# Go
+*.test
+*.out
+coverage.txt
+coverage.html
+*.prof
+
+# Task
+.task/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
