@@ -62,7 +62,7 @@ jobs:
 
       - name: Upload coverage
         if: github.event_name == 'push'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage.out
@@ -116,7 +116,7 @@ jobs:
           go build -o dist/assettune-video ./cmd/video
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-linux-amd64
           path: dist/*
