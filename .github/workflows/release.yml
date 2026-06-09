@@ -3,22 +3,20 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g. v1.2.3). Leave empty to use the latest pushed tag.'
+        description: "Tag to release (e.g. v1.2.3)"
         required: false
-        default: ''
+        default: ""
 
 permissions:
   contents: write
 
 env:
-  GO_VERSION: '1.26.4'
+  GO_VERSION: "1.26.4"
   BINARY_NAME: assettune-mcp
-  IMAGE_CLI: cmd/image/main.go
-  VIDEO_CLI: cmd/video/main.go
   PKG_PATH: github.com/devailab/assettune-mcp/internal/server
 
 jobs:
@@ -26,13 +24,16 @@ jobs:
     name: Resolve release version
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.v.outputs.version }}
-      tag: ${{ steps.v.outputs.tag }}
-      is_prerelease: ${{ steps.v.outputs.is_prerelease }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
     steps:
       - name: Determine version
-        id: v
+        id: version
+        shell: bash
         run: |
+          set -euo pipefail
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
             TAG="${{ inputs.tag }}"
           elif [ -n "${{ github.ref_name }}" ] && [[ "${{ github.ref_name }}" == v* ]]; then
@@ -41,19 +42,24 @@ jobs:
             echo "No tag found in event context." >&2
             exit 1
           fi
+
           VERSION="${TAG#v}"
           IS_PRERELEASE="false"
+
           if [[ "$VERSION" == *-* ]]; then
             IS_PRERELEASE="true"
           fi
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+
           echo "Releasing tag=$TAG version=$VERSION prerelease=$IS_PRERELEASE"
 
   build:
-    name: Build (${{ matrix.target }})
+    name: Build ${{ matrix.target }}
     needs: resolve-version
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -61,28 +67,47 @@ jobs:
           - target: linux-amd64
             goos: linux
             goarch: amd64
-            runner: ubuntu-latest
-            archive: tar.gz
-            cross_cc: ''
+            runner: ubuntu-24.04
+            archive_ext: tar.gz
+
           - target: linux-arm64
             goos: linux
             goarch: arm64
-            runner: ubuntu-latest
-            archive: tar.gz
-            cross_cc: aarch64-linux-gnu-gcc
-          - target: darwin-amd64
-            goos: darwin
-            goarch: amd64
-            runner: macos-13
-            archive: tar.gz
-            cross_cc: ''
+            runner: ubuntu-24.04-arm
+            archive_ext: tar.gz
+
           - target: darwin-arm64
             goos: darwin
             goarch: arm64
             runner: macos-latest
-            archive: tar.gz
-            cross_cc: ''
-    runs-on: ${{ matrix.runner }}
+            archive_ext: tar.gz
+
+          - target: windows-amd64
+            goos: windows
+            goarch: amd64
+            runner: windows-latest
+            archive_ext: zip
+            msystem: UCRT64
+            msys_prefix: /ucrt64
+            msys_packages: >-
+              mingw-w64-ucrt-x86_64-gcc
+              mingw-w64-ucrt-x86_64-pkgconf
+              mingw-w64-ucrt-x86_64-libvips
+              zip
+
+          - target: windows-arm64
+            goos: windows
+            goarch: arm64
+            runner: windows-11-arm
+            archive_ext: zip
+            msystem: CLANGARM64
+            msys_prefix: /clangarm64
+            msys_packages: >-
+              mingw-w64-clang-aarch64-clang
+              mingw-w64-clang-aarch64-pkgconf
+              mingw-w64-clang-aarch64-libvips
+              zip
+
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -94,92 +119,142 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      - name: Install libvips (Linux)
+      - name: Install libvips on Linux
         if: matrix.goos == 'linux'
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y libvips-dev
-          if [ -n "${{ matrix.cross_cc }}" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-          fi
+          sudo apt-get install -y libvips-dev pkg-config
 
-      - name: Install libvips (macOS)
+      - name: Install libvips on macOS
         if: matrix.goos == 'darwin'
-        run: brew install vips
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install vips
 
-      - name: Build binaries
+      - name: Set up MSYS2 on Windows
+        if: matrix.goos == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: ${{ matrix.msys_packages }}
+
+      - name: Build binaries on Unix
+        if: matrix.goos != 'windows'
+        shell: bash
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: '1'
-          CC: ${{ matrix.cross_cc }}
-          CXX: ${{ matrix.cross_cc }}
-          VERSION: ${{ needs.resolve-version.outputs.version }}
-          TAG: ${{ needs.resolve-version.outputs.tag }}
+          CGO_ENABLED: "1"
         run: |
           set -euo pipefail
+
           mkdir -p dist
-          ldflags="-s -w -X '${{ env.PKG_PATH }}.Version=${{ needs.resolve-version.outputs.tag }}'"
-          go build -trimpath -ldflags "$ldflags" -o dist/${{ env.BINARY_NAME }} .
-          go build -trimpath -ldflags "$ldflags" -o dist/assettune-image ./cmd/image
-          go build -trimpath -ldflags "$ldflags" -o dist/assettune-video ./cmd/video
+
+          LDFLAGS="-s -w -X '${{ env.PKG_PATH }}.Version=${{ needs.resolve-version.outputs.tag }}'"
+
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/${{ env.BINARY_NAME }}" .
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/assettune-image" ./cmd/image
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/assettune-video" ./cmd/video
+
           chmod +x dist/*
 
-      - name: Package (tar.gz)
-        if: matrix.archive == 'tar.gz'
-        working-directory: dist
+      - name: Build binaries on Windows
+        if: matrix.goos == 'windows'
+        shell: msys2 {0}
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "1"
         run: |
-          ARCHIVE_NAME="${{ env.BINARY_NAME }}_${{ needs.resolve-version.outputs.tag }}_${{ matrix.target }}.tar.gz"
-          tar -czf "../$ARCHIVE_NAME" .
+          set -euo pipefail
 
-      - name: Generate checksums
-        working-directory: ${{ github.workspace }}
-        run: |
-          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
-            sha256sum "${{ env.BINARY_NAME }}_${{ needs.resolve-version.outputs.tag }}_${{ matrix.target }}.tar.gz" >> checksums.txt
+          export PATH="${{ matrix.msys_prefix }}/bin:$PATH"
+          export PKG_CONFIG_PATH="${{ matrix.msys_prefix }}/lib/pkgconfig"
+
+          if [ "${{ matrix.goarch }}" = "arm64" ]; then
+            export CC=clang
+            export CXX=clang++
+          else
+            export CC=gcc
+            export CXX=g++
           fi
 
-      - name: Upload artifacts
+          mkdir -p dist
+
+          LDFLAGS="-s -w -X '${{ env.PKG_PATH }}.Version=${{ needs.resolve-version.outputs.tag }}'"
+
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/${{ env.BINARY_NAME }}.exe" .
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/assettune-image.exe" ./cmd/image
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/assettune-video.exe" ./cmd/video
+
+          # Runtime DLLs required by libvips/govips on Windows.
+          cp "${{ matrix.msys_prefix }}"/bin/*.dll dist/
+
+      - name: Package tar.gz
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVE_NAME="${{ env.BINARY_NAME }}_${{ needs.resolve-version.outputs.tag }}_${{ matrix.target }}.tar.gz"
+
+          tar -czf "$ARCHIVE_NAME" -C dist .
+
+          sha256sum "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+
+      - name: Package zip
+        if: matrix.archive_ext == 'zip'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+
+          ARCHIVE_NAME="${{ env.BINARY_NAME }}_${{ needs.resolve-version.outputs.tag }}_${{ matrix.target }}.zip"
+
+          cd dist
+          zip -r "../$ARCHIVE_NAME" .
+          cd ..
+
+          sha256sum "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: |
-            ${{ env.BINARY_NAME }}_${{ needs.resolve-version.outputs.tag }}_${{ matrix.target }}.tar.gz
-            checksums.txt
+            ${{ env.BINARY_NAME }}_${{ needs.resolve-version.outputs.tag }}_${{ matrix.target }}.${{ matrix.archive_ext }}
+            ${{ env.BINARY_NAME }}_${{ needs.resolve-version.outputs.tag }}_${{ matrix.target }}.${{ matrix.archive_ext }}.sha256
           if-no-files-found: error
           retention-days: 7
 
   release:
     name: Publish GitHub release
-    needs: [resolve-version, build]
+    needs:
+      - resolve-version
+      - build
     runs-on: ubuntu-latest
+
     steps:
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
           path: artifacts
 
-      - name: List artifacts
-        run: find artifacts -type f | sort
-
-      - name: Flatten artifact directories
+      - name: Prepare release assets
+        shell: bash
         run: |
-          mkdir -p release-assets
-          for archive in artifacts/*/; do
-            for f in "$archive"*; do
-              [ -f "$f" ] || continue
-              if [ "$(basename "$f")" = "checksums.txt" ]; then
-                cat "$f" >> release-assets/checksums.txt
-              else
-                cp "$f" release-assets/
-              fi
-            done
-          done
-          ls -la release-assets
+          set -euo pipefail
 
-      - name: Show checksums
-        working-directory: release-assets
-        run: cat checksums.txt
+          mkdir -p release-assets
+
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} release-assets/ \;
+
+          cd release-assets
+          cat *.sha256 > checksums.txt
+          ls -la
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
@@ -190,10 +265,8 @@ jobs:
           prerelease: ${{ needs.resolve-version.outputs.is_prerelease == 'true' }}
           fail_on_unmatched_files: true
           files: |
-            release-assets/assettune-mcp_${{ needs.resolve-version.outputs.tag }}_linux-amd64.tar.gz
-            release-assets/assettune-mcp_${{ needs.resolve-version.outputs.tag }}_linux-arm64.tar.gz
-            release-assets/assettune-mcp_${{ needs.resolve-version.outputs.tag }}_darwin-amd64.tar.gz
-            release-assets/assettune-mcp_${{ needs.resolve-version.outputs.tag }}_darwin-arm64.tar.gz
+            release-assets/*.tar.gz
+            release-assets/*.zip
             release-assets/checksums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
